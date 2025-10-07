@@ -7,7 +7,7 @@
 % path to each file in question.
 function IteratePath(dataPath, func, args)
     arguments
-        dataPath (1,1) string {mustBeFile}
+        dataPath (1,1) string
         func (1,1) function_handle
         args cell = {}
     end

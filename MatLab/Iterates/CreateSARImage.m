@@ -8,8 +8,8 @@ function CreateSARImage(dataPath, low, high, dbConversion, normalise)
         dataPath (1,1) string {mustBeFile}
         low (1,1) double
         high (1,1) double
-        dbConversion (1,1) bool
-        normalise (1,1) bool
+        dbConversion (1,1) logical
+        normalise (1,1) logical
     end
 
     addpath("../Utils");
