@@ -1,6 +1,3 @@
 # PyCharm specific files and folders
 .idea/
 __pycache__
-
-# Models, tentatively.
-Models

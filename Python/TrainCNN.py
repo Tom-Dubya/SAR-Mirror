@@ -1,6 +1,8 @@
 import argparse
 import os
-from typing import List
+from typing import List, Dict
+
+from pathlib import Path
 
 import pickle
 import time
@@ -11,11 +13,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets
 
-from StandardSarCNN import StandardSarCNN
+from Models.GetModel import get_model
+
 
 def main():
     try:
         parser: argparse.ArgumentParser = argparse.ArgumentParser()
+        parser.add_argument("model_name",
+                            type=str,
+                            help="Model name.")
         parser.add_argument("out_name",
                             type = str,
                             help = "The root name of output files.")
@@ -28,6 +34,11 @@ def main():
         parser.add_argument("num_epochs",
                             type=int,
                             help="Number of training epochs.")
+        parser.add_argument("--min_epochs",
+                            type=int,
+                            help="Number of epochs forced despite patience suggesting otherwise.",
+                            required=False,
+                            default=-1)
         parser.add_argument("--batch_size",
                             type=int,
                             help="Samples per batch.",
@@ -43,40 +54,75 @@ def main():
                             help="Number of no improvement epochs that will be tolerated.",
                             required=False,
                             default=5)
+        parser.add_argument("--weight_decay",
+                            type=float,
+                            help="Number of no improvement epochs that will be tolerated.",
+                            required=False,
+                            default=0.0)
+        parser.add_argument("--scheduler_step_size",
+                            type=float,
+                            help="The number epochs after which learning rate will be reduced.",
+                            required=False,
+                            default=10.0)
+        parser.add_argument("--learning_rate_decay",
+                            type=float,
+                            help="The learning rate decay corresponding with scheduler_step_size.",
+                            required=False,
+                            default=1.0)
+        parser.add_argument("--max_gradient_norm",
+                            type=float,
+                            help="Maximal norm for gradient clipping.",
+                            required=False,
+                            default=10.0)
         parser.add_argument("--out_folder",
                             type=str,
                             help="Output folder path.",
                             required=False,
                             default="Output")
-        parser.add_argument("--test_parameters",
+        parser.add_argument("--testing_mode",
                             type=bool,
-                            help="True enable learning weight scheduling, gradient clipping, and weight decay.",
+                            help="Enables some weird parameters...",
                             required=False,
                             default=False)
         args = parser.parse_args()
+        model_name: str = args.model_name
         out_root: str = args.out_name
         train_directory: str = args.train_dir
         test_directory: str = args.test_dir
         num_epochs: int = args.num_epochs
+        min_epochs: int = args.min_epochs
         batch_size: int = args.batch_size
         learning_rate: float = args.learning_rate
         patience: int = args.patience
+        weight_decay: float = args.weight_decay
+        scheduler_step_size: int = args.scheduler_step_size
+        learning_rate_decay: float = args.learning_rate_decay
+        max_gradient_norm: float = args.max_gradient_norm
         out_directory: str = args.out_folder
-        test_mode: bool = args.test_parameters
+        testing_mode: bool = args.testing_mode
 
-        transform = StandardSarCNN.transform()
-        train_dataset = datasets.ImageFolder(root=train_directory, transform=transform)
-        test_dataset = datasets.ImageFolder(root=test_directory, transform=transform)
+        train_dir = Path(train_directory)
+        num_classes = sum(1 for item in train_dir.iterdir() if item.is_dir())
+        model = get_model(model_name, num_classes)
+
+        def init_matlab_he(m):
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        if testing_mode:
+            model.apply(init_matlab_he)
+
+        train_dataset = datasets.ImageFolder(root=train_directory, transform=model.train_transform)
+        test_dataset = datasets.ImageFolder(root=test_directory, transform=model.test_transform)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        num_classes = len(train_dataset.classes)
-        model = StandardSarCNN(num_classes)
-
         # Loss & optimizer
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=(1e-4 if test_mode else 0.0))
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step_size, gamma=learning_rate_decay)
 
         start = time.time()
 
@@ -85,6 +131,27 @@ def main():
         history_training_loss: List[float] = []
         history_validation_accuracy: List[float] = []
         history_validation_loss: List[float] = []
+
+        history_training_accuracy_hf: List[float] = []
+        history_training_loss_hf: List[float] = []
+        history_validation_accuracy_hf: List[float] = []
+        history_validation_loss_hf: List[float] = []
+
+        saved_roots : List[str] = []
+        saved_epoch : Dict[str, int] = {}
+        def save_model(save_epoch: int, overwrite: bool = False):
+            if overwrite:
+                for saved_root in saved_roots:
+                    if os.path.exists(f"{saved_root}.pt"):
+                        os.remove(f"{saved_root}.pt")
+                saved_roots.clear()
+                saved_epoch.clear()
+
+            os.makedirs(f"{out_directory}", exist_ok=True)
+            save_root = f"{out_directory}/{out_root}_{len(saved_roots) + 1}"
+            torch.save(model.state_dict(), f"{save_root}.pt")
+            saved_roots.append(save_root)
+            saved_epoch[f"{out_root}_{len(saved_roots) + 1}"] = save_epoch
 
         best_validation_loss = float("inf")
         epoch_since_last_improve = 0
@@ -101,13 +168,20 @@ def main():
                 loss = criterion(outputs, labels)
                 loss.backward()
 
-                training_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
-                training_correct += (predicted == labels).sum().item()
-                training_total += labels.size(0)
+                iteration_correct = (predicted == labels).sum().item()
+                iteration_total = labels.size(0)
+                iteration_loss = loss.item()
 
-                if test_mode:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                training_loss += iteration_loss
+                training_correct += iteration_correct
+                training_total += iteration_total
+
+                # Save training iteration data
+                history_training_accuracy_hf.append(iteration_correct / iteration_total * 100)
+                history_training_loss_hf.append(iteration_loss)
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_gradient_norm)
                 optimizer.step()
             epoch_training_accuracy = training_correct / training_total * 100
             epoch_training_loss = training_loss / len(train_loader)
@@ -123,11 +197,19 @@ def main():
                 for images, labels in test_loader:
                     outputs = model(images)
                     loss = criterion(outputs, labels)
-                    validation_loss += loss.item()
 
                     _, predicted = torch.max(outputs, 1)
-                    validation_correct += (predicted == labels).sum().item()
-                    validation_total += labels.size(0)
+                    iteration_correct = (predicted == labels).sum().item()
+                    iteration_total = labels.size(0)
+                    iteration_loss = loss.item()
+
+                    validation_correct += iteration_correct
+                    validation_total += iteration_total
+                    validation_loss += iteration_loss
+
+                    # Save testing iteration data
+                    history_validation_accuracy_hf.append(iteration_correct / iteration_total * 100)
+                    history_validation_loss_hf.append(iteration_loss)
             epoch_validation_accuracy = validation_correct / validation_total * 100
             epoch_validation_loss = validation_loss / len(test_loader)
             history_validation_accuracy.append(epoch_validation_accuracy)
@@ -137,41 +219,40 @@ def main():
                   f"Accuracy: {epoch_training_accuracy:.2f}%, Loss: {epoch_training_loss:.4f}, "
                   f"V-Accuracy: {epoch_validation_accuracy:.2f}%, V-Loss: {epoch_validation_loss:.4f}")
 
-            if epoch_validation_loss < best_validation_loss:
+            if epoch_validation_loss <= best_validation_loss:
                 best_validation_loss = epoch_validation_loss
-                os.makedirs(f"{out_directory}", exist_ok=True)
-                torch.save(model.state_dict(), f"{out_directory}/{out_root}.pt")
                 epoch_since_last_improve = 0
+                save_model(epoch, True)
             else:
-                if epoch_since_last_improve == patience:
+                save_model(epoch)
+                epoch_since_last_improve += 1
+                if (min_epochs <= 0 or epoch >= min_epochs) and epoch_since_last_improve == patience:
                     print(f"Patience threshold met, terminating training.")
                     break
-                epoch_since_last_improve += 1
 
-            if test_mode:
-                scheduler.step()
+            scheduler.step()
 
         end = time.time()
         elapsed = end - start
-        print(f"Training completed in {elapsed / 60} minutes and {elapsed % 60} seconds.")
+        elapsed_hours = int(elapsed // 3600)
+        elapsed_minutes = int(elapsed % 3600 // 60)
+        elapsed_seconds = round(elapsed % 60, 2)
+        print(f"Training completed in {elapsed_hours}:{elapsed_minutes}:{elapsed_seconds}, saved: {len(saved_roots) + 1} models.")
 
-        model.eval()
-        testing_correct = 0
-        testing_total = 0
-        with torch.no_grad():
-            for images, labels in test_loader:
-                outputs = model(images)
-                _, predicted = torch.max(outputs, 1)
-                testing_total += labels.size(0)
-                testing_correct += (predicted == labels).sum().item()
-        testing_accuracy = testing_correct / testing_total * 100
-        print(f"Overall accuracy on test dataset: {testing_accuracy:.2f}%")
+        history = {
+            "epoch_training_accuracy": history_training_accuracy,
+            "epoch_training_loss": history_training_loss,
+            "epoch_validation_accuracy": history_validation_accuracy,
+            "epoch_validation_loss": history_validation_loss,
+            "iteration_training_accuracy": history_training_accuracy_hf,
+            "iteration_training_loss": history_training_loss_hf,
+            "iteration_validation_accuracy": history_validation_accuracy_hf,
+            "iteration_validation_loss": history_validation_loss_hf,
+            "saved_epochs": saved_epoch,
+        }
 
         with open(f"{out_directory}/{out_root}.pkl", "wb") as file:
-            pickle.dump(history_training_accuracy, file)
-            pickle.dump(history_training_loss, file)
-            pickle.dump(history_validation_accuracy, file)
-            pickle.dump(history_validation_loss, file)
+            pickle.dump(history, file)
 
     except Exception as exception:
         print(exception)

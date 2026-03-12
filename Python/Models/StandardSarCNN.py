@@ -3,7 +3,8 @@ import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 
-
+# This model is based off an architecture detailed in the following documentation:
+# https://www.mathworks.com/help/radar/ug/sar-target-classification-using-deep-learning.html
 class StandardSarCNN(nn.Module):
     def __init__(self, num_classes : int):
         super(StandardSarCNN, self).__init__()
@@ -25,9 +26,6 @@ class StandardSarCNN(nn.Module):
 
         self.pool = nn.MaxPool2d(2, 2)
 
-        # Input formula is (H * K - 1) * (W * K - 1) * C
-        # By the time our forward pass reaches FC1, the H and W are reduced from 128x128 to 8x8 through the 4 pools.
-        # K (kernel size) is 6 and C (channel) is 512, both from convolution layer #9.
         self.fc1 = nn.Linear(3 * 3 * 512, 512)
 
         # 10 reflects the number of MSTAR classes
@@ -73,24 +71,30 @@ class StandardSarCNN(nn.Module):
             self.fc2
         )
 
+        def transforms_to_PIL(image):
+            if isinstance(image, Image.Image):
+                return image
+            return transforms.ToPILImage()(image)
+
+        self.train_transform = transforms.Compose([
+            transforms_to_PIL,
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
+        self.test_transform = transforms.Compose([
+            transforms_to_PIL,
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
     def forward(self, x):
         x = self.features(x)
         # Must flatten input layers before FC-ing. MATLAB does this step implicitly.
         x = torch.flatten(x, 1)
         x = self.classifier(x)
         return x
-
-    @staticmethod
-    def transform():
-        def transforms_to_PIL(image):
-            if isinstance(image, Image.Image):
-                return image
-            return transforms.ToPILImage()(image)
-
-        return transforms.Compose([
-            transforms_to_PIL,
-            transforms.Grayscale(num_output_channels=1),   # force grayscale if model expects 1 channel
-            transforms.Resize((128, 128)),                 # resize to match input size
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))           # normalize to [-1,1]
-        ])
